@@ -63,6 +63,8 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=src/cuda/gather_mla_cache_kernel.cu");
     println!("cargo:rerun-if-changed=src/cuda/gather_kv_cache_kernel.cu");
     println!("cargo:rerun-if-changed=src/cuda/flashinfer_decode.cu");
+    println!("cargo:rerun-if-changed=src/cuda/flashinfer_decode_quant.cu");
+    println!("cargo:rerun-if-changed=src/cuda/reshape_and_cache_quant_kernel.cu");
     println!("cargo:rerun-if-changed=src/cuda/flashinfer_mla_decode.cu");
     println!("cargo:rerun-if-changed=src/cuda/update_kvscales.cu");
     println!("cargo:rerun-if-changed=src/cuda/flash_attn_sinks.cu");
@@ -81,6 +83,7 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=src/cuda/flashinfer/vec_dtypes.cuh");
     println!("cargo:rerun-if-changed=src/cuda/flashinfer/attention/cascade.cuh");
     println!("cargo:rerun-if-changed=src/cuda/flashinfer/attention/decode.cuh");
+    println!("cargo:rerun-if-changed=src/cuda/flashinfer/attention/decode_quant.cuh");
     println!("cargo:rerun-if-changed=src/cuda/flashinfer/attention/default_decode_params.cuh");
     println!("cargo:rerun-if-changed=src/cuda/flashinfer/attention/mask.cuh");
     println!("cargo:rerun-if-changed=src/cuda/flashinfer/attention/state.cuh");
