@@ -698,6 +698,441 @@ pub fn gather_kv_cache_flashinfer(
     Ok((k_out.clone(), v_out.clone()))
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn reshape_and_cache_quantized(
+    key: &Tensor,
+    value: &Tensor,
+    key_cache: &Tensor,
+    value_cache: &Tensor,
+    key_scales: &Tensor,
+    value_scales: &Tensor,
+    slot_mapping: &Tensor,
+) -> Result<()> {
+    let dtype = key.dtype();
+    if !matches!(dtype, DType::F16 | DType::BF16) || value.dtype() != dtype {
+        candle_core::bail!("reshape_and_cache_quantized expects f16/bf16 key/value");
+    }
+    for (name, t) in [
+        ("key_cache", key_cache),
+        ("value_cache", value_cache),
+        ("key_scales", key_scales),
+        ("value_scales", value_scales),
+    ] {
+        if t.dtype() != DType::U8 {
+            candle_core::bail!("reshape_and_cache_quantized expects u8 {name}");
+        }
+    }
+    if slot_mapping.dtype() != DType::I64 {
+        candle_core::bail!("reshape_and_cache_quantized expects i64 slot_mapping");
+    }
+
+    let (num_tokens, num_heads, head_size) = key.dims3()?;
+    if value.dims3()? != (num_tokens, num_heads, head_size) {
+        candle_core::bail!("reshape_and_cache_quantized key/value shape mismatch");
+    }
+    let (_, cache_heads, block_size, cache_head_size) = key_cache.dims4()?;
+    if cache_heads != num_heads || cache_head_size != head_size {
+        candle_core::bail!("reshape_and_cache_quantized key_cache shape mismatch");
+    }
+    if value_cache.dims4()? != (key_cache.dims4()?.0, num_heads, block_size, head_size / 2)
+        || key_scales.dims4()? != (key_cache.dims4()?.0, num_heads, block_size, head_size / 16)
+        || value_scales.dims4()? != key_scales.dims4()?
+    {
+        candle_core::bail!("reshape_and_cache_quantized cache/scale shape mismatch");
+    }
+    if slot_mapping.dims1()? != num_tokens {
+        candle_core::bail!("reshape_and_cache_quantized slot_mapping length mismatch");
+    }
+
+    let (key_s, key_l) = key.storage_and_layout();
+    let (value_s, value_l) = value.storage_and_layout();
+    let (key_cache_s, key_cache_l) = key_cache.storage_and_layout();
+    let (value_cache_s, value_cache_l) = value_cache.storage_and_layout();
+    let (key_scales_s, key_scales_l) = key_scales.storage_and_layout();
+    let (value_scales_s, value_scales_l) = value_scales.storage_and_layout();
+    let (slot_s, slot_l) = slot_mapping.storage_and_layout();
+
+    let key_s = match &*key_s {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("key must be a cuda tensor"),
+    };
+    let value_s = match &*value_s {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("value must be a cuda tensor"),
+    };
+    let key_cache_s = match &*key_cache_s {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("key_cache must be a cuda tensor"),
+    };
+    let value_cache_s = match &*value_cache_s {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("value_cache must be a cuda tensor"),
+    };
+    let key_scales_s = match &*key_scales_s {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("key_scales must be a cuda tensor"),
+    };
+    let value_scales_s = match &*value_scales_s {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("value_scales must be a cuda tensor"),
+    };
+    let slot_s = match &*slot_s {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("slot_mapping must be a cuda tensor"),
+    };
+
+    let (key_ptr, _key_guard) = match dtype {
+        DType::F16 => slice_ptr(key_s.as_cuda_slice::<half::f16>()?, key_l.start_offset()),
+        DType::BF16 => slice_ptr(key_s.as_cuda_slice::<half::bf16>()?, key_l.start_offset()),
+        _ => unreachable!(),
+    };
+    let (value_ptr, _value_guard) = match dtype {
+        DType::F16 => slice_ptr(
+            value_s.as_cuda_slice::<half::f16>()?,
+            value_l.start_offset(),
+        ),
+        DType::BF16 => slice_ptr(
+            value_s.as_cuda_slice::<half::bf16>()?,
+            value_l.start_offset(),
+        ),
+        _ => unreachable!(),
+    };
+    let (key_cache_ptr, _key_cache_guard) = slice_ptr(
+        key_cache_s.as_cuda_slice::<u8>()?,
+        key_cache_l.start_offset(),
+    );
+    let (value_cache_ptr, _value_cache_guard) = slice_ptr(
+        value_cache_s.as_cuda_slice::<u8>()?,
+        value_cache_l.start_offset(),
+    );
+    let (key_scales_ptr, _key_scales_guard) = slice_ptr(
+        key_scales_s.as_cuda_slice::<u8>()?,
+        key_scales_l.start_offset(),
+    );
+    let (value_scales_ptr, _value_scales_guard) = slice_ptr(
+        value_scales_s.as_cuda_slice::<u8>()?,
+        value_scales_l.start_offset(),
+    );
+    let (slot_ptr, _slot_guard) = slice_ptr(slot_s.as_cuda_slice::<i64>()?, slot_l.start_offset());
+
+    unsafe {
+        crate::cuda::ffi::reshape_and_cache_quant(
+            key_ptr as *const core::ffi::c_void,
+            value_ptr as *const core::ffi::c_void,
+            key_cache_ptr as *const core::ffi::c_void,
+            value_cache_ptr as *const core::ffi::c_void,
+            key_scales_ptr as *const core::ffi::c_void,
+            value_scales_ptr as *const core::ffi::c_void,
+            slot_ptr as *const core::ffi::c_long,
+            num_tokens as i32,
+            num_heads as i32,
+            head_size as i32,
+            block_size as i32,
+            key_l.stride()[0] as i32,
+            value_l.stride()[0] as i32,
+            dtype_code(dtype, "reshape_and_cache_quantized")?,
+            key_s.device().cuda_stream().cu_stream(),
+        );
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn flashinfer_decode_quantized(
+    query: &Tensor,
+    key_cache: &Tensor,
+    value_cache: &Tensor,
+    key_scales: &Tensor,
+    value_scales: &Tensor,
+    paged_kv_indptr: &Tensor,
+    paged_kv_indices: &Tensor,
+    paged_kv_last_page_len: &Tensor,
+    request_indices: &Tensor,
+    kv_tile_indices: &Tensor,
+    o_indptr: &Tensor,
+    kv_chunk_size: &Tensor,
+    block_valid_mask: &Tensor,
+    sm_scale: f32,
+    scratch: Option<FlashInferDecodeScratch<'_>>,
+) -> Result<Tensor> {
+    let dtype = query.dtype();
+    if !matches!(dtype, DType::F16 | DType::BF16) {
+        candle_core::bail!("flashinfer_decode_quantized expects f16/bf16 query");
+    }
+    for (name, t) in [
+        ("key_cache", key_cache),
+        ("value_cache", value_cache),
+        ("key_scales", key_scales),
+        ("value_scales", value_scales),
+    ] {
+        if t.dtype() != DType::U8 {
+            candle_core::bail!("flashinfer_decode_quantized expects u8 {name}");
+        }
+    }
+    for (name, tensor) in [
+        ("paged_kv_indptr", paged_kv_indptr),
+        ("paged_kv_indices", paged_kv_indices),
+        ("paged_kv_last_page_len", paged_kv_last_page_len),
+        ("request_indices", request_indices),
+        ("kv_tile_indices", kv_tile_indices),
+        ("o_indptr", o_indptr),
+        ("kv_chunk_size", kv_chunk_size),
+    ] {
+        if tensor.dtype() != DType::I32 {
+            candle_core::bail!("flashinfer_decode_quantized expects {name} to be i32");
+        }
+    }
+    if block_valid_mask.dtype() != DType::U8 {
+        candle_core::bail!("flashinfer_decode_quantized expects block_valid_mask to be u8");
+    }
+
+    let (batch_size, num_qo_heads, head_size) = query.dims3()?;
+    let (num_pages, num_kv_heads, page_size, cache_head_size) = key_cache.dims4()?;
+    if cache_head_size != head_size
+        || value_cache.dims4()? != (num_pages, num_kv_heads, page_size, head_size / 2)
+        || key_scales.dims4()? != (num_pages, num_kv_heads, page_size, head_size / 16)
+        || value_scales.dims4()? != key_scales.dims4()?
+    {
+        candle_core::bail!("flashinfer_decode_quantized cache/scale shapes incompatible");
+    }
+    let padded_batch_size = request_indices.dims1()?;
+    if paged_kv_indptr.dims1()? != batch_size + 1
+        || paged_kv_last_page_len.dims1()? != batch_size
+        || padded_batch_size < batch_size
+        || kv_tile_indices.dims1()? != padded_batch_size
+        || o_indptr.dims1()? != batch_size + 1
+        || kv_chunk_size.dims1()? != 1
+        || block_valid_mask.dims1()? != padded_batch_size
+    {
+        candle_core::bail!("flashinfer_decode_quantized metadata shapes are invalid");
+    }
+
+    let out =
+        unsafe { Tensor::empty((batch_size, num_qo_heads, head_size), dtype, query.device())? };
+
+    let (q_s, q_l) = query.storage_and_layout();
+    let (kc_s, kc_l) = key_cache.storage_and_layout();
+    let (vc_s, vc_l) = value_cache.storage_and_layout();
+    let (ks_s, ks_l) = key_scales.storage_and_layout();
+    let (vs_s, vs_l) = value_scales.storage_and_layout();
+    let (indptr_s, indptr_l) = paged_kv_indptr.storage_and_layout();
+    let (indices_s, indices_l) = paged_kv_indices.storage_and_layout();
+    let (last_s, last_l) = paged_kv_last_page_len.storage_and_layout();
+    let (request_s, request_l) = request_indices.storage_and_layout();
+    let (tile_s, tile_l) = kv_tile_indices.storage_and_layout();
+    let (o_indptr_s, o_indptr_l) = o_indptr.storage_and_layout();
+    let (chunk_s, chunk_l) = kv_chunk_size.storage_and_layout();
+    let (mask_s, mask_l) = block_valid_mask.storage_and_layout();
+    let (out_s, out_l) = out.storage_and_layout();
+
+    let q_s = match &*q_s {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("query must be a cuda tensor"),
+    };
+    let kc_s = match &*kc_s {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("key_cache must be a cuda tensor"),
+    };
+    let vc_s = match &*vc_s {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("value_cache must be a cuda tensor"),
+    };
+    let ks_s = match &*ks_s {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("key_scales must be a cuda tensor"),
+    };
+    let vs_s = match &*vs_s {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("value_scales must be a cuda tensor"),
+    };
+    let indptr_s = match &*indptr_s {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("paged_kv_indptr must be a cuda tensor"),
+    };
+    let indices_s = match &*indices_s {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("paged_kv_indices must be a cuda tensor"),
+    };
+    let last_s = match &*last_s {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("paged_kv_last_page_len must be a cuda tensor"),
+    };
+    let request_s = match &*request_s {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("request_indices must be a cuda tensor"),
+    };
+    let tile_s = match &*tile_s {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("kv_tile_indices must be a cuda tensor"),
+    };
+    let o_indptr_s = match &*o_indptr_s {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("o_indptr must be a cuda tensor"),
+    };
+    let chunk_s = match &*chunk_s {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("kv_chunk_size must be a cuda tensor"),
+    };
+    let mask_s = match &*mask_s {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("block_valid_mask must be a cuda tensor"),
+    };
+    let out_s = match &*out_s {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("out must be a cuda tensor"),
+    };
+
+    let (q_ptr, _q_guard) = match dtype {
+        DType::F16 => slice_ptr(q_s.as_cuda_slice::<half::f16>()?, q_l.start_offset()),
+        DType::BF16 => slice_ptr(q_s.as_cuda_slice::<half::bf16>()?, q_l.start_offset()),
+        _ => unreachable!(),
+    };
+    let (kc_ptr, _kc_guard) = slice_ptr(kc_s.as_cuda_slice::<u8>()?, kc_l.start_offset());
+    let (vc_ptr, _vc_guard) = slice_ptr(vc_s.as_cuda_slice::<u8>()?, vc_l.start_offset());
+    let (ks_ptr, _ks_guard) = slice_ptr(ks_s.as_cuda_slice::<u8>()?, ks_l.start_offset());
+    let (vs_ptr, _vs_guard) = slice_ptr(vs_s.as_cuda_slice::<u8>()?, vs_l.start_offset());
+    let (out_ptr, _out_guard) = match dtype {
+        DType::F16 => slice_ptr(out_s.as_cuda_slice::<half::f16>()?, out_l.start_offset()),
+        DType::BF16 => slice_ptr(out_s.as_cuda_slice::<half::bf16>()?, out_l.start_offset()),
+        _ => unreachable!(),
+    };
+    let (indptr_ptr, _indptr_guard) =
+        slice_ptr(indptr_s.as_cuda_slice::<i32>()?, indptr_l.start_offset());
+    let (indices_ptr, _indices_guard) =
+        slice_ptr(indices_s.as_cuda_slice::<i32>()?, indices_l.start_offset());
+    let (last_ptr, _last_guard) = slice_ptr(last_s.as_cuda_slice::<i32>()?, last_l.start_offset());
+    let (request_ptr, _request_guard) =
+        slice_ptr(request_s.as_cuda_slice::<i32>()?, request_l.start_offset());
+    let (tile_ptr, _tile_guard) = slice_ptr(tile_s.as_cuda_slice::<i32>()?, tile_l.start_offset());
+    let (o_indptr_ptr, _o_indptr_guard) = slice_ptr(
+        o_indptr_s.as_cuda_slice::<i32>()?,
+        o_indptr_l.start_offset(),
+    );
+    let (chunk_ptr, _chunk_guard) =
+        slice_ptr(chunk_s.as_cuda_slice::<i32>()?, chunk_l.start_offset());
+    let (mask_ptr, _mask_guard) = slice_ptr(mask_s.as_cuda_slice::<u8>()?, mask_l.start_offset());
+
+    let split_kv = padded_batch_size > batch_size;
+    if let Some(scratch) = scratch {
+        if scratch.tmp_v.dtype() != dtype || scratch.tmp_s.dtype() != DType::F32 {
+            candle_core::bail!("flashinfer_decode_quantized scratch dtypes are invalid");
+        }
+    }
+    let owned_tmp_v = if split_kv && scratch.is_none() {
+        Some(unsafe {
+            Tensor::empty(
+                (padded_batch_size, num_qo_heads, head_size),
+                dtype,
+                query.device(),
+            )?
+        })
+    } else {
+        None
+    };
+    let owned_tmp_s = if split_kv && scratch.is_none() {
+        Some(unsafe {
+            Tensor::empty(
+                (padded_batch_size, num_qo_heads),
+                DType::F32,
+                query.device(),
+            )?
+        })
+    } else {
+        None
+    };
+    let tmp_v = if split_kv {
+        scratch
+            .as_ref()
+            .map(|scratch| scratch.tmp_v)
+            .or(owned_tmp_v.as_ref())
+    } else {
+        None
+    };
+    let tmp_s = if split_kv {
+        scratch
+            .as_ref()
+            .map(|scratch| scratch.tmp_s)
+            .or(owned_tmp_s.as_ref())
+    } else {
+        None
+    };
+    let tmp_v_storage = tmp_v.map(|tensor| tensor.storage_and_layout());
+    let tmp_s_storage = tmp_s.map(|tensor| tensor.storage_and_layout());
+    let (tmp_v_ptr, _tmp_v_guard) = if let Some((tmp_v_s, tmp_v_l)) = tmp_v_storage.as_ref() {
+        let tmp_v_s = match &**tmp_v_s {
+            Storage::Cuda(s) => s,
+            _ => candle_core::bail!("tmp_v must be a cuda tensor"),
+        };
+        match dtype {
+            DType::F16 => {
+                let (ptr, guard) = slice_ptr(
+                    tmp_v_s.as_cuda_slice::<half::f16>()?,
+                    tmp_v_l.start_offset(),
+                );
+                (ptr, Some(guard))
+            }
+            DType::BF16 => {
+                let (ptr, guard) = slice_ptr(
+                    tmp_v_s.as_cuda_slice::<half::bf16>()?,
+                    tmp_v_l.start_offset(),
+                );
+                (ptr, Some(guard))
+            }
+            _ => unreachable!(),
+        }
+    } else {
+        (0, None)
+    };
+    let (tmp_s_ptr, _tmp_s_guard) = if let Some((tmp_s_s, tmp_s_l)) = tmp_s_storage.as_ref() {
+        let tmp_s_s = match &**tmp_s_s {
+            Storage::Cuda(s) => s,
+            _ => candle_core::bail!("tmp_s must be a cuda tensor"),
+        };
+        let (ptr, guard) = slice_ptr(tmp_s_s.as_cuda_slice::<f32>()?, tmp_s_l.start_offset());
+        (ptr, Some(guard))
+    } else {
+        (0, None)
+    };
+
+    let status = unsafe {
+        crate::cuda::ffi::flashinfer_decode_quant(
+            q_ptr as *const core::ffi::c_void,
+            kc_ptr as *const core::ffi::c_void,
+            vc_ptr as *const core::ffi::c_void,
+            ks_ptr as *const core::ffi::c_void,
+            vs_ptr as *const core::ffi::c_void,
+            indptr_ptr as *const i32,
+            indices_ptr as *const i32,
+            last_ptr as *const i32,
+            request_ptr as *const i32,
+            tile_ptr as *const i32,
+            o_indptr_ptr as *const i32,
+            chunk_ptr as *const i32,
+            mask_ptr as *const u8,
+            out_ptr as *const core::ffi::c_void,
+            tmp_v_ptr as *const core::ffi::c_void,
+            tmp_s_ptr as *const core::ffi::c_void,
+            batch_size as i32,
+            padded_batch_size as i32,
+            num_qo_heads as i32,
+            num_kv_heads as i32,
+            head_size as i32,
+            page_size as i32,
+            q_l.stride()[0] as i32,
+            q_l.stride()[1] as i32,
+            sm_scale,
+            dtype_code(dtype, "flashinfer_decode_quantized")?,
+            q_s.device().cuda_stream().cu_stream(),
+        )
+    };
+    if status != 0 {
+        candle_core::bail!("flashinfer_decode_quantized failed with status {status}");
+    }
+
+    Ok(out.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
