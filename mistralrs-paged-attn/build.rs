@@ -109,6 +109,10 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=src/cuda/flashinfer_decode.cu");
     println!("cargo:rerun-if-changed=src/cuda/flashinfer_decode_quant.cu");
     println!("cargo:rerun-if-changed=src/cuda/reshape_and_cache_quant_kernel.cu");
+    println!("cargo:rerun-if-changed=src/cuda/reshape_and_cache_fp8.cu");
+    println!("cargo:rerun-if-changed=src/cuda/xqa/launch.cu");
+    println!("cargo:rerun-if-changed=src/cuda/xqa/mha.cu");
+    println!("cargo:rerun-if-changed=src/cuda/xqa/mha.h");
     println!("cargo:rerun-if-changed=src/cuda/flashinfer_mla_decode.cu");
     println!("cargo:rerun-if-changed=src/cuda/update_kvscales.cu");
     println!("cargo:rerun-if-changed=src/cuda/flash_attn_sinks.cu");
@@ -251,10 +255,76 @@ fn main() -> Result<()> {
         println!("cargo:rustc-link-lib=dylib=stdc++");
         println!("cargo:rustc-cfg=has_fa3_fp8_paged");
     }
+    build_xqa_fp8(&out_dir, compute_cap)?;
 
     if using_fp8 {
         println!("cargo:rustc-cfg=has_fp8");
     }
+    Ok(())
+}
+
+#[cfg(all(feature = "cuda", target_family = "unix"))]
+fn build_xqa_fp8(build_dir: &std::path::Path, compute_cap: usize) -> Result<()> {
+    use std::process::Command;
+
+    let manifest = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?);
+    let xqa_dir = manifest.join("src/cuda/xqa");
+    let nvcc = std::env::var("NVCC").unwrap_or_else(|_| "nvcc".into());
+    let arch = format!("arch=compute_{compute_cap},code=sm_{compute_cap}");
+    let mut objects = Vec::new();
+    for src in ["mha.cu", "launch.cu"] {
+        println!("cargo:rerun-if-changed={}", xqa_dir.join(src).display());
+        let obj = build_dir.join(format!("xqa_{}.o", src.replace('.', "_")));
+        let status = Command::new(&nvcc)
+            .args([
+                "-c",
+                "-std=c++17",
+                "-O3",
+                "--expt-relaxed-constexpr",
+                "--expt-extended-lambda",
+                "--use_fast_math",
+                "--compiler-options",
+                "-fPIC",
+                "-gencode",
+                &arch,
+                "-DNDEBUG=1",
+                "-DBEAM_WIDTH=1",
+                "-DUSE_INPUT_KV=0",
+                "-DUSE_CUSTOM_BARRIER=1",
+                "-DINPUT_FP16=1",
+                "-DDTYPE=__half",
+                "-DCACHE_ELEM_ENUM=2",
+                "-DTOKENS_PER_PAGE=32",
+                "-DHEAD_ELEMS=128",
+                "-DHEAD_GRP_SIZE=4",
+                "-DSLIDING_WINDOW=0",
+                "-DLOW_PREC_OUTPUT=0",
+                "-DSPEC_DEC=0",
+                "-DMLA_WRAPPER=0",
+                "-DUSE_SM90_MHA=0",
+            ])
+            .arg(format!("-I{}", xqa_dir.display()))
+            .arg(xqa_dir.join(src))
+            .arg("-o")
+            .arg(&obj)
+            .status()?;
+        if !status.success() {
+            anyhow::bail!("nvcc failed compiling XQA {src}");
+        }
+        objects.push(obj);
+    }
+    let lib = build_dir.join("libxqa_fp8.a");
+    let mut ar = Command::new("ar");
+    ar.arg("rcs").arg(&lib);
+    for obj in &objects {
+        ar.arg(obj);
+    }
+    let status = ar.status()?;
+    if !status.success() {
+        anyhow::bail!("ar failed creating libxqa_fp8.a");
+    }
+    println!("cargo:rustc-link-lib=static=xqa_fp8");
+    println!("cargo:rustc-link-lib=stdc++");
     Ok(())
 }
 
