@@ -8,5 +8,6 @@ pub use backend::{
     flash_attn_sinks_varlen, flashinfer_decode, flashinfer_decode_quantized, flashinfer_mla_decode,
     gather_kv_cache, gather_kv_cache_flashinfer, gather_mla_cache, is_flashinfer_cache,
     kv_scale_update, paged_attention, reshape_and_cache, reshape_and_cache_flashinfer,
-    reshape_and_cache_quantized, swap_blocks, FlashInferDecodeScratch,
+    reshape_and_cache_fp8, reshape_and_cache_quantized, flashinfer_xqa_fp8, swap_blocks,
+    FlashInferDecodeScratch,
 };

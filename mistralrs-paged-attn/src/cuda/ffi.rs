@@ -147,6 +147,43 @@ extern "C" {
         stream: CUstream,
     );
 
+    pub fn reshape_and_cache_fp8(
+        key: *const c_void,
+        value: *const c_void,
+        key_cache: *const c_void,
+        value_cache: *const c_void,
+        slot_mapping: *const c_long,
+        num_tokens: c_int,
+        num_heads: c_int,
+        head_size: c_int,
+        block_size: c_int,
+        key_stride: c_int,
+        value_stride: c_int,
+        dtype: u32,
+        stream: CUstream,
+    );
+
+    pub fn xqa_fp8_decode(
+        num_kv_heads: c_int,
+        q_scale: f32,
+        output: *const c_void,
+        q: *const c_void,
+        k_cache: *const c_void,
+        v_cache: *const c_void,
+        page_table: *const c_int,
+        max_seq_len: c_int,
+        seq_lens: *const c_uint,
+        batch_size: c_int,
+        kv_scale: f32,
+        semaphores: *const c_uint,
+        scratch: *const c_void,
+        kv_stride_page: u64,
+        kv_stride_token: u64,
+        kv_stride_head: u64,
+        enable_pdl: c_int,
+        stream: CUstream,
+    ) -> c_int;
+
     pub fn flashinfer_decode_quant(
         q: *const c_void,
         key_cache: *const c_void,

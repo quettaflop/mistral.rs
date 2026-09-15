@@ -1036,3 +1036,254 @@ pub fn flashinfer_decode_quantized(
 
     Ok(out.clone())
 }
+
+#[allow(clippy::too_many_arguments)]
+pub fn reshape_and_cache_fp8(
+    key: &Tensor,
+    value: &Tensor,
+    key_cache: &Tensor,
+    value_cache: &Tensor,
+    slot_mapping: &Tensor,
+) -> Result<()> {
+    let dtype = key.dtype();
+    if !matches!(dtype, DType::F16 | DType::BF16) || value.dtype() != dtype {
+        candle_core::bail!("reshape_and_cache_fp8 expects f16/bf16 key/value");
+    }
+    if key_cache.dtype() != DType::U8 || value_cache.dtype() != DType::U8 {
+        candle_core::bail!("reshape_and_cache_fp8 expects u8 caches");
+    }
+    if slot_mapping.dtype() != DType::I64 {
+        candle_core::bail!("reshape_and_cache_fp8 expects i64 slot_mapping");
+    }
+
+    let (num_tokens, num_heads, head_size) = key.dims3()?;
+    if value.dims3()? != (num_tokens, num_heads, head_size) {
+        candle_core::bail!("reshape_and_cache_fp8 key/value shape mismatch");
+    }
+    let (_, cache_heads, block_size, cache_head_size) = key_cache.dims4()?;
+    if cache_heads != num_heads
+        || cache_head_size != head_size
+        || value_cache.dims4()? != key_cache.dims4()?
+    {
+        candle_core::bail!("reshape_and_cache_fp8 cache shape mismatch");
+    }
+    if slot_mapping.dims1()? != num_tokens {
+        candle_core::bail!("reshape_and_cache_fp8 slot_mapping length mismatch");
+    }
+
+    let (key_s, key_l) = key.storage_and_layout();
+    let (value_s, value_l) = value.storage_and_layout();
+    let (key_cache_s, key_cache_l) = key_cache.storage_and_layout();
+    let (value_cache_s, value_cache_l) = value_cache.storage_and_layout();
+    let (slot_s, slot_l) = slot_mapping.storage_and_layout();
+
+    let key_s = match &*key_s {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("key must be a cuda tensor"),
+    };
+    let value_s = match &*value_s {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("value must be a cuda tensor"),
+    };
+    let key_cache_s = match &*key_cache_s {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("key_cache must be a cuda tensor"),
+    };
+    let value_cache_s = match &*value_cache_s {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("value_cache must be a cuda tensor"),
+    };
+    let slot_s = match &*slot_s {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("slot_mapping must be a cuda tensor"),
+    };
+
+    let (key_ptr, _key_guard) = match dtype {
+        DType::F16 => slice_ptr(key_s.as_cuda_slice::<half::f16>()?, key_l.start_offset()),
+        DType::BF16 => slice_ptr(key_s.as_cuda_slice::<half::bf16>()?, key_l.start_offset()),
+        _ => unreachable!(),
+    };
+    let (value_ptr, _value_guard) = match dtype {
+        DType::F16 => slice_ptr(value_s.as_cuda_slice::<half::f16>()?, value_l.start_offset()),
+        DType::BF16 => slice_ptr(value_s.as_cuda_slice::<half::bf16>()?, value_l.start_offset()),
+        _ => unreachable!(),
+    };
+    let (key_cache_ptr, _key_cache_guard) =
+        slice_ptr(key_cache_s.as_cuda_slice::<u8>()?, key_cache_l.start_offset());
+    let (value_cache_ptr, _value_cache_guard) = slice_ptr(
+        value_cache_s.as_cuda_slice::<u8>()?,
+        value_cache_l.start_offset(),
+    );
+    let (slot_ptr, _slot_guard) = slice_ptr(slot_s.as_cuda_slice::<i64>()?, slot_l.start_offset());
+
+    unsafe {
+        crate::cuda::ffi::reshape_and_cache_fp8(
+            key_ptr as *const core::ffi::c_void,
+            value_ptr as *const core::ffi::c_void,
+            key_cache_ptr as *const core::ffi::c_void,
+            value_cache_ptr as *const core::ffi::c_void,
+            slot_ptr as *const core::ffi::c_long,
+            num_tokens as i32,
+            num_heads as i32,
+            head_size as i32,
+            block_size as i32,
+            key_l.stride()[0] as i32,
+            value_l.stride()[0] as i32,
+            dtype_code(dtype, "reshape_and_cache_fp8")?,
+            key_s.device().cuda_stream().cu_stream(),
+        );
+    }
+    Ok(())
+}
+
+const XQA_WORKSPACE_BYTES: usize = 256 * 1024 * 1024;
+const XQA_SEMAPHORE_BYTES: usize = 8 * 1024 * 1024;
+const XQA_HEAD_GRP: usize = 4;
+
+fn xqa_workspace(device: &candle_core::Device) -> Result<Tensor> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    static CACHE: OnceLock<Mutex<HashMap<usize, Tensor>>> = OnceLock::new();
+    let candle_core::DeviceLocation::Cuda { gpu_id } = device.location() else {
+        candle_core::bail!("xqa workspace requires a cuda device");
+    };
+    let mut cache = CACHE.get_or_init(Default::default).lock().unwrap();
+    if let Some(ws) = cache.get(&gpu_id) {
+        return Ok(ws.clone());
+    }
+    let ws = Tensor::zeros((XQA_WORKSPACE_BYTES,), DType::U8, device)?;
+    cache.insert(gpu_id, ws.clone());
+    Ok(ws)
+}
+
+pub fn flashinfer_xqa_fp8(
+    query: &Tensor,
+    key_cache: &Tensor,
+    value_cache: &Tensor,
+    page_table: &Tensor,
+    seq_lens: &Tensor,
+    sm_scale: f32,
+) -> Result<Tensor> {
+    let dtype = query.dtype();
+    if dtype != DType::F16 {
+        candle_core::bail!("flashinfer_xqa_fp8 expects f16 query (got {dtype:?})");
+    }
+    if key_cache.dtype() != DType::U8 || value_cache.dtype() != DType::U8 {
+        candle_core::bail!("flashinfer_xqa_fp8 expects u8 e4m3 caches");
+    }
+    if page_table.dtype() != DType::I32 || seq_lens.dtype() != DType::I32 {
+        candle_core::bail!("flashinfer_xqa_fp8 expects i32 page_table and seq_lens");
+    }
+
+    let (batch_size, num_qo_heads, head_size) = query.dims3()?;
+    let (num_pages, num_kv_heads, page_size, cache_head_size) = key_cache.dims4()?;
+    if cache_head_size != head_size || value_cache.dims4()? != key_cache.dims4()? {
+        candle_core::bail!("flashinfer_xqa_fp8 cache shapes incompatible");
+    }
+    if num_qo_heads != num_kv_heads * XQA_HEAD_GRP {
+        candle_core::bail!(
+            "flashinfer_xqa_fp8 kernel is compiled for GQA {XQA_HEAD_GRP} (got {} q / {} kv)",
+            num_qo_heads,
+            num_kv_heads
+        );
+    }
+    let (pt_bs, max_pages) = page_table.dims2()?;
+    if pt_bs != batch_size || seq_lens.dims1()? != batch_size {
+        candle_core::bail!("flashinfer_xqa_fp8 page_table/seq_lens batch mismatch");
+    }
+    if page_size == 0 || max_pages == 0 {
+        candle_core::bail!("flashinfer_xqa_fp8 empty page table");
+    }
+    let _ = num_pages;
+
+    let q = query.unsqueeze(1)?.contiguous()?;
+    let out_4d = unsafe { Tensor::empty((batch_size, 1, num_qo_heads, head_size), dtype, query.device())? };
+    let workspace = xqa_workspace(query.device())?;
+    let semaphores = workspace.narrow(0, 0, XQA_SEMAPHORE_BYTES)?;
+    let scratch = workspace.narrow(0, XQA_SEMAPHORE_BYTES, XQA_WORKSPACE_BYTES - XQA_SEMAPHORE_BYTES)?;
+
+    let (q_s, q_l) = q.storage_and_layout();
+    let (kc_s, kc_l) = key_cache.storage_and_layout();
+    let (vc_s, vc_l) = value_cache.storage_and_layout();
+    let (pt_s, pt_l) = page_table.storage_and_layout();
+    let (sl_s, sl_l) = seq_lens.storage_and_layout();
+    let (out_s, out_l) = out_4d.storage_and_layout();
+    let (sem_s, sem_l) = semaphores.storage_and_layout();
+    let (scr_s, scr_l) = scratch.storage_and_layout();
+
+    let q_s = match &*q_s {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("query must be a cuda tensor"),
+    };
+    let kc_s = match &*kc_s {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("key_cache must be a cuda tensor"),
+    };
+    let vc_s = match &*vc_s {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("value_cache must be a cuda tensor"),
+    };
+    let pt_s = match &*pt_s {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("page_table must be a cuda tensor"),
+    };
+    let sl_s = match &*sl_s {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("seq_lens must be a cuda tensor"),
+    };
+    let out_s = match &*out_s {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("output must be a cuda tensor"),
+    };
+    let sem_s = match &*sem_s {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("workspace must be a cuda tensor"),
+    };
+    let scr_s = match &*scr_s {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("workspace must be a cuda tensor"),
+    };
+
+    let (q_ptr, _q_g) = slice_ptr(q_s.as_cuda_slice::<half::f16>()?, q_l.start_offset());
+    let (kc_ptr, _kc_g) = slice_ptr(kc_s.as_cuda_slice::<u8>()?, kc_l.start_offset());
+    let (vc_ptr, _vc_g) = slice_ptr(vc_s.as_cuda_slice::<u8>()?, vc_l.start_offset());
+    let (pt_ptr, _pt_g) = slice_ptr(pt_s.as_cuda_slice::<i32>()?, pt_l.start_offset());
+    let (sl_ptr, _sl_g) = slice_ptr(sl_s.as_cuda_slice::<i32>()?, sl_l.start_offset());
+    let (out_ptr, _out_g) = slice_ptr(out_s.as_cuda_slice::<half::f16>()?, out_l.start_offset());
+    let (sem_ptr, _sem_g) = slice_ptr(sem_s.as_cuda_slice::<u8>()?, sem_l.start_offset());
+    let (scr_ptr, _scr_g) = slice_ptr(scr_s.as_cuda_slice::<u8>()?, scr_l.start_offset());
+
+    let kv_stride_page = (num_kv_heads * page_size * head_size) as u64;
+    let kv_stride_token = head_size as u64;
+    let kv_stride_head = (page_size * head_size) as u64;
+    let q_scale = sm_scale * (head_size as f32).sqrt();
+    let max_seq_len = (max_pages * page_size) as i32;
+
+    let status = unsafe {
+        crate::cuda::ffi::xqa_fp8_decode(
+            num_kv_heads as i32,
+            q_scale,
+            out_ptr as *const core::ffi::c_void,
+            q_ptr as *const core::ffi::c_void,
+            kc_ptr as *const core::ffi::c_void,
+            vc_ptr as *const core::ffi::c_void,
+            pt_ptr as *const i32,
+            max_seq_len,
+            sl_ptr as *const u32,
+            batch_size as i32,
+            1.0,
+            sem_ptr as *const u32,
+            scr_ptr as *const core::ffi::c_void,
+            kv_stride_page,
+            kv_stride_token,
+            kv_stride_head,
+            1,
+            q_s.device().cuda_stream().cu_stream(),
+        )
+    };
+    if status != 0 {
+        candle_core::bail!("xqa_fp8_decode failed with status {status}");
+    }
+    out_4d.squeeze(1)
+}
