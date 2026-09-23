@@ -31,6 +31,8 @@
 #include <cuda_runtime.h>
 
 #include "hostUtils.h"
+#include <mutex>
+#include <stdexcept>
 #ifndef NDEBUG
 #include <cstdio>
 #endif
@@ -2954,6 +2956,25 @@ CUBIN_EXPORT __global__ __launch_bounds__(256, nbCtaPerSM) void kernel_mha(
 static constexpr auto kernel_mha = kernel_mha_impl;
 #endif
 
+// cudaFuncSetAttribute only applies to the current device, so configure each device on first use.
+static uint32_t configureKernel() {
+  constexpr int kMaxDevices = 64;
+  static std::once_flag configured[kMaxDevices];
+  static uint32_t sizes[kMaxDevices];
+  int dev = 0;
+  checkCuda(cudaGetDevice(&dev));
+  if (dev < 0 || dev >= kMaxDevices) {
+    throw std::runtime_error("xqa: device index out of range");
+  }
+  std::call_once(configured[dev], [dev] {
+    uint32_t size;
+    checkCuda(cudaMemcpyFromSymbol(&size, smemSize, sizeof(smemSize)));
+    checkCuda(cudaFuncSetAttribute(kernel_mha, cudaFuncAttributeMaxDynamicSharedMemorySize, size));
+    sizes[dev] = size;
+  });
+  return sizes[dev];
+}
+
 #ifndef GENERATE_CUBIN
 void launchMHA(
     cudaDeviceProp const& prop, uint32_t nbKHeads,
@@ -3003,12 +3024,7 @@ void launchMHA(
 #if USE_INPUT_KV
   throw std::runtime_error("not implemented");
 #else
-  static uint32_t const hostSmemSize = [&]() {
-    uint32_t size;
-    checkCuda(cudaMemcpyFromSymbol(&size, smemSize, sizeof(smemSize)));
-    checkCuda(cudaFuncSetAttribute(kernel_mha, cudaFuncAttributeMaxDynamicSharedMemorySize, size));
-    return size;
-  }();
+  uint32_t const hostSmemSize = configureKernel();
   uint32_t const nbVHeads = nbKHeads;
   uint32_t const nbQHeads = nbKHeads * headGrpSize;
 
@@ -3089,15 +3105,6 @@ void launchMHA(
 }
 #endif
 
-static uint32_t configureKernel() {
-  uint32_t size;
-  cudaMemcpyFromSymbol(&size, smemSize, sizeof(smemSize));
-  cudaFuncSetAttribute(kernel_mha, cudaFuncAttributeMaxDynamicSharedMemorySize, size);
-  return size;
-}
-
-static uint32_t const hostSmemSize = configureKernel();
-
 void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32_t slidingWinSize,
                          float qScale, float const* qScalePtr, OutputHead* output,
 #if LOW_PREC_OUTPUT
@@ -3120,6 +3127,7 @@ void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32
                          uint64_t sf_stride_page, uint64_t sf_stride_token, uint64_t sf_stride_head,
 #endif
                          cudaStream_t stream) {
+  uint32_t const hostSmemSize = configureKernel();
   uint32_t const nbSubSeqPerSeq = [&]() -> uint32_t {
     if (!allowMultiBlockMode) {
       return 1;
